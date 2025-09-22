@@ -1,0 +1,16 @@
+name = "openai-workers-ai"
+main = "src/worker.js"
+compatibility_date = "2025-09-22"
+
+#绑定ai变量
+[ai]
+binding = "AI"
+
+# api key变量配置
+# 多个key使用,分割
+[vars]
+VALID_API_KEYS = "sk-01,sk-02"
+
+
+
+
