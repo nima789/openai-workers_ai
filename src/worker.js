@@ -77,25 +77,60 @@ export default {
             reasoning: body.reasoning ?? { effort: "medium" }
           };
         } else {
-          // 旧模型：拼接 prompt
-          let prompt = '';
-          for (const message of body.messages) {
-            if (message.role === 'system') prompt += `System: ${message.content}\n\n`;
-            if (message.role === 'user') prompt += `User: ${message.content}\n\n`;
-            if (message.role === 'assistant') prompt += `Assistant: ${message.content}\n\n`;
-          }
-          prompt += 'Assistant: ';
+          // 其他模型：使用标准 messages 格式
+          // 确保消息格式正确
+          const messages = body.messages.map(msg => ({
+            role: msg.role,
+            content: msg.content || ""
+          }));
 
           aiRequest = {
-            prompt,
+            messages: messages,
             temperature: body.temperature ?? 0.7,
             top_p: body.top_p ?? 0.9,
             max_tokens: body.max_tokens ?? 4096,
           };
+
+          // 如果模型不支持 messages 格式，回退到 prompt 格式
+          // 但首先尝试 messages 格式
         }
 
-        // 调用 Cloudflare AI
-        const response = await env.AI.run(cfModel, aiRequest);
+        let response;
+        try {
+          // 调用 Cloudflare AI
+          response = await env.AI.run(cfModel, aiRequest);
+        } catch (error) {
+          console.error('AI API Error:', error);
+          
+          // 如果 messages 格式失败，尝试 prompt 格式（仅对非 gpt-oss 模型）
+          if (!useResponsesAPI) {
+            console.log('Falling back to prompt format for model:', model);
+            
+            let prompt = '';
+            for (const message of body.messages) {
+              if (message.role === 'system') prompt += `System: ${message.content}\n\n`;
+              if (message.role === 'user') prompt += `User: ${message.content}\n\n`;
+              if (message.role === 'assistant') prompt += `Assistant: ${message.content}\n\n`;
+            }
+            prompt += 'Assistant: ';
+
+            const fallbackRequest = {
+              prompt,
+              temperature: body.temperature ?? 0.7,
+              top_p: body.top_p ?? 0.9,
+              max_tokens: body.max_tokens ?? 4096,
+            };
+
+            try {
+              response = await env.AI.run(cfModel, fallbackRequest);
+            } catch (fallbackError) {
+              console.error('Fallback also failed:', fallbackError);
+              throw fallbackError;
+            }
+          } else {
+            throw error;
+          }
+        }
 
         const completionId = 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
         const timestamp = Math.floor(Date.now() / 1000);
@@ -112,10 +147,26 @@ export default {
               .join("\n");
           }
         } else {
-          assistantContent = response.response ?? "";
+          // 处理不同的响应格式
+          if (response.response) {
+            assistantContent = response.response;
+          } else if (response.generated_text) {
+            assistantContent = response.generated_text;
+          } else if (typeof response === 'string') {
+            assistantContent = response;
+          } else if (response.choices && response.choices[0] && response.choices[0].message) {
+            assistantContent = response.choices[0].message.content;
+          } else {
+            console.log('Unexpected response format:', response);
+            assistantContent = JSON.stringify(response);
+          }
+        }
+
+        // 清理响应内容（移除可能的提示重复）
+        if (assistantContent.includes('Assistant: ')) {
+          assistantContent = assistantContent.split('Assistant: ').pop();
         }
         
-
         // 流式输出
         if (body.stream) {
           const encoder = new TextEncoder();
@@ -178,7 +229,7 @@ export default {
       } catch (error) {
         console.error('Error:', error);
         return new Response(JSON.stringify({
-          error: { message: 'Internal server error', type: 'server_error', code: 'internal_error' }
+          error: { message: `Internal server error: ${error.message}`, type: 'server_error', code: 'internal_error' }
         }), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
       }
     }
