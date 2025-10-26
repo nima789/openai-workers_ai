@@ -1,259 +1,348 @@
-export default {
-  async fetch(request, env, ctx) {
-    // 处理 CORS 预检请求
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 200,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
-    }
+// ===== 配置常量 =====
+const CONFIG = {
+  MAX_REQUEST_SIZE: 1024 * 1024, // 1MB
+  STREAM_CHUNK_SIZE: 100, // 字符数
+  DEFAULT_TEMPERATURE: 0.7,
+  DEFAULT_TOP_P: 0.9,
+  DEFAULT_MAX_TOKENS: 4096,
+  CACHE_TTL: 300, // 5分钟缓存
+};
 
-    // 验证 API Key
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return new Response(JSON.stringify({
-        error: { message: 'API key required', type: 'invalid_request_error', code: 'invalid_api_key' }
-      }), { status: 401, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-    }
+const MODEL_MAP = {
+  'deepseek-r1': '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
+  'gpt-oss-120b': '@cf/openai/gpt-oss-120b',
+  'gpt-oss-20b': '@cf/openai/gpt-oss-20b',
+  'llama-4-scout': '@cf/meta/llama-4-scout-17b-16e-instruct',
+  'qwen2.5-coder': '@cf/qwen/qwen2.5-coder-32b-instruct',
+  'gemma-3': '@cf/google/gemma-3-12b-it'
+};
 
-    const apiKey = authHeader.substring(7);
-    const validApiKeys = env.VALID_API_KEYS ? env.VALID_API_KEYS.split(',') : ['your-api-key-here'];
-    if (!validApiKeys.includes(apiKey)) {
-      return new Response(JSON.stringify({
-        error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' }
-      }), { status: 401, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-    }
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
 
-    const url = new URL(request.url);
+// ===== 工具函数 =====
+class APIError extends Error {
+  constructor(message, statusCode = 400, code = 'invalid_request_error') {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
 
-    // 模型映射
-    const modelMap = {
-      'deepseek-r1': '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
-      'gpt-oss-120b': '@cf/openai/gpt-oss-120b',
-      'gpt-oss-20b': '@cf/openai/gpt-oss-20b',
-      'llama-4-scout': '@cf/meta/llama-4-scout-17b-16e-instruct',
-      'qwen2.5-coder': '@cf/qwen/qwen2.5-coder-32b-instruct',
-      'gemma-3': '@cf/google/gemma-3-12b-it'
+function createResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS,
+      ...headers,
+    },
+  });
+}
+
+function createErrorResponse(error) {
+  const statusCode = error.statusCode || 500;
+  const errorData = {
+    error: {
+      message: error.message,
+      type: error.code || 'server_error',
+      code: error.code || 'internal_error',
+    },
+  };
+  return createResponse(errorData, statusCode);
+}
+
+// 更准确的 token 估算 (使用 tiktoken 的简化版本)
+function estimateTokens(text) {
+  if (!text) return 0;
+  // 英文约 4 字符/token,中文约 1.5-2 字符/token
+  const avgCharsPerToken = /[\u4e00-\u9fa5]/.test(text) ? 1.8 : 4;
+  return Math.ceil(text.length / avgCharsPerToken);
+}
+
+// ===== 认证中间件 =====
+function validateAuth(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    throw new APIError('API key required', 401, 'invalid_api_key');
+  }
+
+  const apiKey = authHeader.substring(7);
+  const validApiKeys = env.VALID_API_KEYS ? env.VALID_API_KEYS.split(',') : [];
+  
+  if (validApiKeys.length === 0 || !validApiKeys.includes(apiKey)) {
+    throw new APIError('Invalid API key', 401, 'invalid_api_key');
+  }
+  
+  return apiKey;
+}
+
+// ===== AI 请求处理 =====
+async function buildAIRequest(body, cfModel) {
+  const useResponsesAPI = cfModel.startsWith('@cf/openai/gpt-oss');
+
+  if (useResponsesAPI) {
+    const systemMsg = body.messages.find(m => m.role === 'system')?.content || 
+                      "You are a helpful assistant.";
+    const userMsgs = body.messages
+      .filter(m => m.role === 'user')
+      .map(m => m.content)
+      .join("\n");
+
+    return {
+      input: userMsgs,
+      instructions: systemMsg,
+      temperature: body.temperature ?? CONFIG.DEFAULT_TEMPERATURE,
+      top_p: body.top_p ?? CONFIG.DEFAULT_TOP_P,
+      max_tokens: body.max_tokens ?? 2048,
+      reasoning: body.reasoning ?? { effort: "medium" }
     };
+  }
 
-    // 聊天接口
-    if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
-      try {
-        const body = await request.json();
-        if (!body.messages || !Array.isArray(body.messages)) {
-          return new Response(JSON.stringify({
-            error: { message: 'Messages must be an array', type: 'invalid_request_error', code: 'invalid_parameter' }
-          }), { status: 400, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-        }
+  // 标准消息格式
+  return {
+    messages: body.messages.map(msg => ({
+      role: msg.role,
+      content: msg.content || ""
+    })),
+    temperature: body.temperature ?? CONFIG.DEFAULT_TEMPERATURE,
+    top_p: body.top_p ?? CONFIG.DEFAULT_TOP_P,
+    max_tokens: body.max_tokens ?? CONFIG.DEFAULT_MAX_TOKENS,
+  };
+}
 
-        const model = body.model || 'deepseek-r1';
-        const cfModel = modelMap[model];
-        if (!cfModel) {
-          return new Response(JSON.stringify({
-            error: { message: `Model '${model}' not supported`, type: 'invalid_request_error', code: 'model_not_found' }
-          }), { status: 400, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-        }
+async function callAI(env, cfModel, aiRequest, body, useResponsesAPI) {
+  try {
+    return await env.AI.run(cfModel, aiRequest);
+  } catch (error) {
+    // 仅对非 gpt-oss 模型尝试 fallback
+    if (useResponsesAPI) throw error;
 
-        // 构造 AI 请求参数
-        let aiRequest = {};
-        let useResponsesAPI = cfModel.startsWith('@cf/openai/gpt-oss');
+    console.warn('Falling back to prompt format:', error.message);
 
-        if (useResponsesAPI) {
-          // Responses API 格式
-          const systemMsg = body.messages.find(m => m.role === 'system')?.content || "You are a helpful assistant.";
-          const userMsgs = body.messages.filter(m => m.role === 'user').map(m => m.content).join("\n");
+    const prompt = body.messages
+      .map(m => {
+        const roleMap = { system: 'System', user: 'User', assistant: 'Assistant' };
+        return `${roleMap[m.role]}: ${m.content}`;
+      })
+      .join("\n\n") + "\n\nAssistant: ";
 
-          aiRequest = {
-            input: userMsgs,
-            instructions: systemMsg,
-            temperature: body.temperature ?? 0.7,
-            top_p: body.top_p ?? 0.9,
-            max_tokens: body.max_tokens ?? 2048,
-            reasoning: body.reasoning ?? { effort: "medium" }
-          };
-        } else {
-          // 其他模型：使用标准 messages 格式
-          // 确保消息格式正确
-          const messages = body.messages.map(msg => ({
-            role: msg.role,
-            content: msg.content || ""
-          }));
+    return await env.AI.run(cfModel, {
+      prompt,
+      temperature: aiRequest.temperature,
+      top_p: aiRequest.top_p,
+      max_tokens: aiRequest.max_tokens,
+    });
+  }
+}
 
-          aiRequest = {
-            messages: messages,
-            temperature: body.temperature ?? 0.7,
-            top_p: body.top_p ?? 0.9,
-            max_tokens: body.max_tokens ?? 4096,
-          };
+function extractContent(response, useResponsesAPI) {
+  if (useResponsesAPI) {
+    if (response.output && Array.isArray(response.output)) {
+      return response.output
+        .flatMap(msg => msg.content
+          .filter(c => c.type === "output_text")
+          .map(c => c.text)
+        )
+        .join("\n");
+    }
+  }
 
-          // 如果模型不支持 messages 格式，回退到 prompt 格式
-          // 但首先尝试 messages 格式
-        }
+  // 按优先级尝试不同格式
+  const content = response.response || 
+                  response.generated_text || 
+                  response.choices?.[0]?.message?.content ||
+                  (typeof response === 'string' ? response : null);
 
-        let response;
-        try {
-          // 调用 Cloudflare AI
-          response = await env.AI.run(cfModel, aiRequest);
-        } catch (error) {
-          console.error('AI API Error:', error);
-          
-          // 如果 messages 格式失败，尝试 prompt 格式（仅对非 gpt-oss 模型）
-          if (!useResponsesAPI) {
-            console.log('Falling back to prompt format for model:', model);
-            
-            let prompt = '';
-            for (const message of body.messages) {
-              if (message.role === 'system') prompt += `System: ${message.content}\n\n`;
-              if (message.role === 'user') prompt += `User: ${message.content}\n\n`;
-              if (message.role === 'assistant') prompt += `Assistant: ${message.content}\n\n`;
-            }
-            prompt += 'Assistant: ';
+  if (!content) {
+    console.warn('Unexpected response format:', response);
+    return JSON.stringify(response);
+  }
 
-            const fallbackRequest = {
-              prompt,
-              temperature: body.temperature ?? 0.7,
-              top_p: body.top_p ?? 0.9,
-              max_tokens: body.max_tokens ?? 4096,
-            };
+  // 清理可能的提示重复
+  return content.includes('Assistant: ') 
+    ? content.split('Assistant: ').pop() 
+    : content;
+}
 
-            try {
-              response = await env.AI.run(cfModel, fallbackRequest);
-            } catch (fallbackError) {
-              console.error('Fallback also failed:', fallbackError);
-              throw fallbackError;
-            }
-          } else {
-            throw error;
-          }
-        }
+// ===== 流式响应生成 =====
+function createStreamResponse(content, model, completionId, timestamp) {
+  const encoder = new TextEncoder();
+  
+  const stream = new ReadableStream({
+    start(controller) {
+      // 开始块
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created: timestamp,
+        model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: "" }, finish_reason: null }]
+      })}\n\n`));
 
-        const completionId = 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
-        const timestamp = Math.floor(Date.now() / 1000);
-
-        // 获取最终回答内容
-        let assistantContent = "";
-        if (useResponsesAPI) {
-          if (response.output && Array.isArray(response.output)) {
-            assistantContent = response.output
-              .flatMap(msg => msg.content
-                .filter(c => c.type === "output_text")
-                .map(c => c.text)
-              )
-              .join("\n");
-          }
-        } else {
-          // 处理不同的响应格式
-          if (response.response) {
-            assistantContent = response.response;
-          } else if (response.generated_text) {
-            assistantContent = response.generated_text;
-          } else if (typeof response === 'string') {
-            assistantContent = response;
-          } else if (response.choices && response.choices[0] && response.choices[0].message) {
-            assistantContent = response.choices[0].message.content;
-          } else {
-            console.log('Unexpected response format:', response);
-            assistantContent = JSON.stringify(response);
-          }
-        }
-
-        // 清理响应内容（移除可能的提示重复）
-        if (assistantContent.includes('Assistant: ')) {
-          assistantContent = assistantContent.split('Assistant: ').pop();
-        }
-        
-        // 流式输出
-        if (body.stream) {
-          const encoder = new TextEncoder();
-          const stream = new ReadableStream({
-            start(controller) {
-              // 开始事件
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                id: completionId,
-                object: 'chat.completion.chunk',
-                created: timestamp,
-                model,
-                choices: [{ index: 0, delta: { role: 'assistant', content: "" }, finish_reason: null }]
-              })}\n\n`));
-
-              // 模拟逐块输出
-              const chunkSize = 20;
-              for (let i = 0; i < assistantContent.length; i += chunkSize) {
-                const chunk = assistantContent.slice(i, i + chunkSize);
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: timestamp,
-                  model,
-                  choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }]
-                })}\n\n`));
-              }
-
-              // 结束事件
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                id: completionId,
-                object: 'chat.completion.chunk',
-                created: timestamp,
-                model,
-                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-              })}\n\n`));
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
-            }
-          });
-          return new Response(stream, {
-            headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' },
-          });
-        }
-
-        // 非流式输出
-        const chatCompletion = {
+      // 内容块
+      for (let i = 0; i < content.length; i += CONFIG.STREAM_CHUNK_SIZE) {
+        const chunk = content.slice(i, i + CONFIG.STREAM_CHUNK_SIZE);
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
           id: completionId,
-          object: 'chat.completion',
+          object: 'chat.completion.chunk',
           created: timestamp,
           model,
-          choices: [{ index: 0, message: { role: 'assistant', content: assistantContent }, finish_reason: 'stop' }],
-          usage: {
-            prompt_tokens: Math.ceil(JSON.stringify(body.messages).length / 4),
-            completion_tokens: Math.ceil(assistantContent.length / 4),
-            total_tokens: Math.ceil((JSON.stringify(body.messages).length + assistantContent.length) / 4)
-          }
-        };
-        return new Response(JSON.stringify(chatCompletion), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-
-      } catch (error) {
-        console.error('Error:', error);
-        return new Response(JSON.stringify({
-          error: { message: `Internal server error: ${error.message}`, type: 'server_error', code: 'internal_error' }
-        }), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+          choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }]
+        })}\n\n`));
       }
+
+      // 结束块
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created: timestamp,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+      })}\n\n`));
+      
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+// ===== 路由处理 =====
+async function handleChatCompletion(request, env) {
+  const body = await request.json();
+
+  // 验证请求体
+  if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+    throw new APIError('Messages must be a non-empty array', 400, 'invalid_parameter');
+  }
+
+  // 验证模型
+  const model = body.model || 'deepseek-r1';
+  const cfModel = MODEL_MAP[model];
+  if (!cfModel) {
+    throw new APIError(`Model '${model}' not supported`, 400, 'model_not_found');
+  }
+
+  // 构建请求
+  const useResponsesAPI = cfModel.startsWith('@cf/openai/gpt-oss');
+  const aiRequest = await buildAIRequest(body, cfModel);
+  
+  // 调用 AI
+  const response = await callAI(env, cfModel, aiRequest, body, useResponsesAPI);
+  const content = extractContent(response, useResponsesAPI);
+
+  // 生成元数据
+  const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').substring(0, 24);
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  // 流式返回
+  if (body.stream) {
+    return createStreamResponse(content, model, completionId, timestamp);
+  }
+
+  // 非流式返回
+  const messagesText = JSON.stringify(body.messages);
+  const promptTokens = estimateTokens(messagesText);
+  const completionTokens = estimateTokens(content);
+
+  return createResponse({
+    id: completionId,
+    object: 'chat.completion',
+    created: timestamp,
+    model,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content },
+      finish_reason: 'stop'
+    }],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens
+    }
+  });
+}
+
+function handleModels() {
+  const models = Object.keys(MODEL_MAP).map(id => ({
+    id,
+    object: 'model',
+    created: Math.floor(Date.now() / 1000),
+    owned_by: 'cloudflare',
+  }));
+
+  return createResponse({ object: 'list', data: models });
+}
+
+function handleHealth() {
+  return createResponse({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    models: Object.keys(MODEL_MAP)
+  });
+}
+
+// ===== 主入口 =====
+export default {
+  async fetch(request, env, ctx) {
+    // CORS 预检
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // 模型列表
-    if (url.pathname === '/v1/models' && request.method === 'GET') {
-      const models = Object.keys(modelMap).map(id => ({
-        id,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'cloudflare',
-        permission: [{ id: 'modelperm-' + id, object: 'model_permission', created: Math.floor(Date.now() / 1000), allow_create_engine: false, allow_sampling: true, allow_logprobs: false, allow_search_indices: false, allow_view: true, allow_fine_tuning: false, organization: '*', group: null, is_blocking: false }]
-      }));
-      return new Response(JSON.stringify({ object: 'list', data: models }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-    }
+    try {
+      const url = new URL(request.url);
 
-    // 健康检查
-    if (url.pathname === '/health' && request.method === 'GET') {
-      return new Response(JSON.stringify({ status: 'healthy', timestamp: new Date().toISOString(), models: Object.keys(modelMap) }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-    }
+      // 公开端点
+      if (url.pathname === '/health' && request.method === 'GET') {
+        return handleHealth();
+      }
 
-    // 404
-    return new Response(JSON.stringify({
-      error: { message: 'Not found', type: 'invalid_request_error', code: 'not_found' }
-    }), { status: 404, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+      if (url.pathname === '/v1/models' && request.method === 'GET') {
+        return handleModels();
+      }
+
+      // 需要认证的端点
+      validateAuth(request, env);
+
+      // 聊天完成
+      if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
+        // 检查请求体大小
+        const contentLength = request.headers.get('content-length');
+        if (contentLength && parseInt(contentLength) > CONFIG.MAX_REQUEST_SIZE) {
+          throw new APIError('Request body too large', 413, 'payload_too_large');
+        }
+
+        return await handleChatCompletion(request, env);
+      }
+
+      // 404
+      throw new APIError('Not found', 404, 'not_found');
+
+    } catch (error) {
+      console.error('Request error:', error);
+      
+      if (error instanceof APIError) {
+        return createErrorResponse(error);
+      }
+      
+      return createErrorResponse(
+        new APIError('Internal server error', 500, 'internal_error')
+      );
+    }
   },
 };
